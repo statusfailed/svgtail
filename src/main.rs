@@ -30,8 +30,8 @@ fn render(
     let offset_x = (width as f32 - svg_size.width() * eff_scale) / 2.0 + pan.0;
     let offset_y = (height as f32 - svg_size.height() * eff_scale) / 2.0 + pan.1;
 
-    let transform = tiny_skia::Transform::from_translate(offset_x, offset_y)
-        .pre_scale(eff_scale, eff_scale);
+    let transform =
+        tiny_skia::Transform::from_translate(offset_x, offset_y).pre_scale(eff_scale, eff_scale);
     resvg::render(tree, transform, &mut pixmap.as_mut());
 
     // Convert premultiplied RGBA bytes to 0x00RRGGBB u32 for minifb
@@ -56,7 +56,7 @@ fn render(
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: svg-view <file.svg>");
+        eprintln!("Usage: svgcat <file.svg>");
         std::process::exit(1);
     }
 
@@ -107,9 +107,7 @@ fn main() {
         // 1. Poll file watcher
         if let Ok(Ok(events)) = rx.try_recv() {
             let filename = svg_path.file_name();
-            let changed = events
-                .iter()
-                .any(|e| e.path.file_name() == filename);
+            let changed = events.iter().any(|e| e.path.file_name() == filename);
             if changed {
                 if let Some(new_tree) = load_svg(&svg_path, &svg_opts) {
                     tree = Some(new_tree);
@@ -134,8 +132,8 @@ fn main() {
         if auto_fit {
             if let Some(ref t) = tree {
                 let svg_size = t.size();
-                fit_scale = (width as f32 / svg_size.width())
-                    .min(height as f32 / svg_size.height());
+                fit_scale =
+                    (width as f32 / svg_size.width()).min(height as f32 / svg_size.height());
             }
         }
 
