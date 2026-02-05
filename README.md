@@ -1,4 +1,4 @@
-# SVG View
+# SVGCat
 
 A minimal SVG viewer in Rust. Usage:
 
