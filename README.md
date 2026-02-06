@@ -2,13 +2,23 @@
 
 A minimal SVG viewer in Rust. Usage:
 
-    svgcat <path-to-svg>
+    svgtail <path>
 
-- Watches file for changes (& able to open a path that doesn't yet exist, and wait for a file)
-- Fits SVG to window on resize / file update (& keeps updated)
+This will:
+
+- Watch `<path>` for changes (and will wait until `<path>` is created if it doesn't exist)
+- Fit the SVG to window on window resize or file update
+
+**Install**:
+
+    cargo install svgtail
 
 **Key bindings**
 
 - Pan using `hjkl` (vim-style)
-- Zoom in/out using `+ / -`
-- Fit-to-window using `r`
+- Zoom in/out using `+` / `-`
+- Reset with `r` (fits image to window)
+
+# Why not `feh`?
+
+I previously used `feh`, but renders SVGs at a fixed resolution so zooming in images is blurry.

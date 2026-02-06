@@ -2,6 +2,12 @@
 name = "svgtail"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "a minimal SVG viewer"
+repository = "https://github.com/statusfailed/svgtail"
+categories = ["command-line-utilities", "graphics"]
+keywords = ["svg", "viewer", "image"]
+readme = "README.md"
 
 [dependencies]
 resvg = "0.45"
