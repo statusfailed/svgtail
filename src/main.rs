@@ -9,7 +9,7 @@ use notify_debouncer_full::{
     DebounceEventResult, new_debouncer,
     notify::{
         RecursiveMode,
-        event::{AccessKind, AccessMode, EventKind, ModifyKind},
+        event::{AccessKind, AccessMode, EventKind},
     },
 };
 use resvg::{tiny_skia, usvg};
@@ -58,7 +58,7 @@ fn render(
 
 fn should_reload(kind: &EventKind) -> bool {
     match kind {
-        // Ignore "Open" accesses, because these can be caused by svgcat itself.
+        // Ignore "Open" accesses, because these can be caused by svgtail itself.
         EventKind::Access(AccessKind::Open(AccessMode::Any)) => false,
         _ => true,
     }
@@ -67,7 +67,7 @@ fn should_reload(kind: &EventKind) -> bool {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: svgcat <file.svg>");
+        eprintln!("Usage: svgtail <file.svg>");
         std::process::exit(1);
     }
 
