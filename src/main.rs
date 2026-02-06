@@ -64,14 +64,57 @@ fn should_reload(kind: &EventKind) -> bool {
     }
 }
 
-fn main() {
+/// Block until `path` exists on disk. If it already exists, return immediately.
+/// Otherwise, watch the parent directory and wait for creation.
+fn wait_for_creation(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    if path.exists() {
+        return Ok(());
+    }
+    eprintln!(
+        "{} does not exist, waiting for it to be created...",
+        path.display()
+    );
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+
+    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
+        let _ = tx.send(res);
+    })?;
+
+    debouncer.watch(&parent, RecursiveMode::NonRecursive)?;
+
+    loop {
+        match rx.recv() {
+            Ok(Ok(events)) => {
+                if events.iter().any(|e| e.paths.iter().any(|p| p == path)) && path.exists() {
+                    return Ok(());
+                }
+            }
+            Ok(Err(_)) => {
+                if path.exists() {
+                    return Ok(());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() != 2 {
         eprintln!("Usage: svgtail <file.svg>");
         std::process::exit(1);
     }
 
-    let svg_path = fs::canonicalize(&args[1]).unwrap_or_else(|_| PathBuf::from(&args[1]));
+    let svg_path = std::path::absolute(&args[1])?;
+
+    wait_for_creation(&svg_path)?;
 
     let mut svg_opts = usvg::Options::default();
     svg_opts.fontdb_mut().load_system_fonts();
@@ -85,13 +128,10 @@ fn main() {
         let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
             // ignore send errors on shutdown
             let _ = tx.send(res);
-        })
-        .unwrap();
+        })?;
 
         // Watch the file itself (best signal/noise). NonRecursive is fine for a file.
-        debouncer
-            .watch(&svg_path, RecursiveMode::NonRecursive)
-            .unwrap();
+        debouncer.watch(&svg_path, RecursiveMode::NonRecursive)?;
         debouncer
     };
 
@@ -99,7 +139,7 @@ fn main() {
     let mut height: usize = 600;
 
     let mut window = Window::new(
-        "SVG View",
+        "svgtail",
         width,
         height,
         WindowOptions {
@@ -107,7 +147,7 @@ fn main() {
             ..Default::default()
         },
     )
-    .expect("Failed to create window");
+    .map_err(|e| format!("{e:?}"))?;
 
     window.set_target_fps(60);
 
@@ -211,11 +251,15 @@ fn main() {
             } else {
                 buffer.fill(0x00333333);
             }
-            window.update_with_buffer(&buffer, width, height).unwrap();
+            window
+                .update_with_buffer(&buffer, width, height)
+                .map_err(|e| format!("{e:?}"))?;
             dirty = false;
         } else {
             // still pump events; avoids full-frame blit
             window.update();
         }
     }
+
+    Ok(())
 }
