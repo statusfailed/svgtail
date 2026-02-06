@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 resvg = "0.45"
 minifb = "0.28"
-notify-debouncer-mini = "0.5"
+notify-debouncer-full = "0.7.0"

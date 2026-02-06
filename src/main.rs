@@ -5,9 +5,14 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use minifb::{Key, Window, WindowOptions};
-use notify_debouncer_mini::notify::RecursiveMode;
-use resvg::tiny_skia;
-use resvg::usvg;
+use notify_debouncer_full::{
+    DebounceEventResult, new_debouncer,
+    notify::{
+        RecursiveMode,
+        event::{AccessKind, AccessMode, EventKind, ModifyKind},
+    },
+};
+use resvg::{tiny_skia, usvg};
 
 fn load_svg(path: &PathBuf, opts: &usvg::Options) -> Option<usvg::Tree> {
     let data = fs::read(path).ok()?;
@@ -34,16 +39,14 @@ fn render(
         tiny_skia::Transform::from_translate(offset_x, offset_y).pre_scale(eff_scale, eff_scale);
     resvg::render(tree, transform, &mut pixmap.as_mut());
 
-    // Convert premultiplied RGBA bytes to 0x00RRGGBB u32 for minifb
     pixmap
         .data()
         .chunks_exact(4)
         .map(|px| {
             let (r, g, b, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
             if a == 0 {
-                0x00333333 // background for fully transparent pixels
+                0x00333333
             } else {
-                // Un-premultiply
                 let r = (r * 255 / a).min(255);
                 let g = (g * 255 / a).min(255);
                 let b = (b * 255 / a).min(255);
@@ -51,6 +54,14 @@ fn render(
             }
         })
         .collect()
+}
+
+fn should_reload(kind: &EventKind) -> bool {
+    match kind {
+        // Ignore "Open" accesses, because these can be caused by svgcat itself.
+        EventKind::Access(AccessKind::Open(AccessMode::Any)) => false,
+        _ => true,
+    }
 }
 
 fn main() {
@@ -67,15 +78,19 @@ fn main() {
 
     let mut tree = load_svg(&svg_path, &svg_opts);
 
-    // Set up file watcher on parent directory
-    let (tx, rx) = mpsc::channel();
+    // Debounced watcher (FULL): preserves original notify::Event (EventKind, paths, etc.)
+    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
     let _debouncer = {
-        let parent = svg_path.parent().unwrap_or(&svg_path);
-        let mut debouncer =
-            notify_debouncer_mini::new_debouncer(Duration::from_millis(200), tx).unwrap();
+        let tx = tx.clone();
+        let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
+            // ignore send errors on shutdown
+            let _ = tx.send(res);
+        })
+        .unwrap();
+
+        // Watch the file itself (best signal/noise). NonRecursive is fine for a file.
         debouncer
-            .watcher()
-            .watch(parent, RecursiveMode::NonRecursive)
+            .watch(&svg_path, RecursiveMode::NonRecursive)
             .unwrap();
         debouncer
     };
@@ -104,22 +119,35 @@ fn main() {
     let mut buffer: Vec<u32> = vec![0; width * height];
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // 1. Poll file watcher
-        if let Ok(Ok(events)) = rx.try_recv() {
-            let filename = svg_path.file_name();
-            let changed = events.iter().any(|e| e.path.file_name() == filename);
-            if changed {
-                if let Some(new_tree) = load_svg(&svg_path, &svg_opts) {
-                    tree = Some(new_tree);
-                    pan = (0.0, 0.0);
-                    zoom = 1.0;
-                    auto_fit = true;
-                    dirty = true;
+        // 1) Drain watcher queue; reload at most once per frame.
+        let mut reload = false;
+        while let Ok(res) = rx.try_recv() {
+            match res {
+                Ok(events) => {
+                    for e in events {
+                        // DebouncedEvent derefs to notify::Event
+                        if e.paths.iter().any(|p| p == &svg_path) && should_reload(&e.kind) {
+                            reload = true;
+                        }
+                    }
+                }
+                Err(_errors) => {
+                    // conservative: if backend reports errors, you may want to reload/rescan
+                    reload = true;
                 }
             }
         }
+        if reload {
+            if let Some(new_tree) = load_svg(&svg_path, &svg_opts) {
+                tree = Some(new_tree);
+                pan = (0.0, 0.0);
+                zoom = 1.0;
+                auto_fit = true;
+                dirty = true;
+            }
+        }
 
-        // 2. Check window resize
+        // 2) Resize
         let (new_w, new_h) = window.get_size();
         if new_w != width || new_h != height {
             width = new_w.max(1);
@@ -128,8 +156,8 @@ fn main() {
             dirty = true;
         }
 
-        // 3. Recompute fit_scale when auto-fitting
-        if auto_fit {
+        // 3) Fit scale only when needed
+        if dirty && auto_fit {
             if let Some(ref t) = tree {
                 let svg_size = t.size();
                 fit_scale =
@@ -137,7 +165,7 @@ fn main() {
             }
         }
 
-        // 4. Handle pan/zoom input
+        // 4) Input -> mark dirty only on change
         let pan_speed = 10.0;
         if window.is_key_down(Key::K) {
             pan.1 += pan_speed;
@@ -176,17 +204,18 @@ fn main() {
             dirty = true;
         }
 
-        // 5. Re-render if dirty
+        // 5) Render + present only when dirty (cuts idle CPU a lot)
         if dirty {
             if let Some(ref t) = tree {
                 buffer = render(t, width as u32, height as u32, pan, zoom, fit_scale);
             } else {
                 buffer.fill(0x00333333);
             }
+            window.update_with_buffer(&buffer, width, height).unwrap();
             dirty = false;
+        } else {
+            // still pump events; avoids full-frame blit
+            window.update();
         }
-
-        // 6. Update window
-        window.update_with_buffer(&buffer, width, height).unwrap();
     }
 }
