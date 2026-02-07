@@ -58,14 +58,11 @@ fn render(
 
 fn should_reload(kind: &EventKind) -> bool {
     match kind {
-        // Ignore "Open" accesses, because these can be caused by svgtail itself.
         EventKind::Access(AccessKind::Open(AccessMode::Any)) => false,
         _ => true,
     }
 }
 
-/// Block until `path` exists on disk. If it already exists, return immediately.
-/// Otherwise, watch the parent directory and wait for creation.
 fn wait_for_creation(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     if path.exists() {
         return Ok(());
@@ -113,7 +110,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let svg_path = std::path::absolute(&args[1])?;
-
     wait_for_creation(&svg_path)?;
 
     let mut svg_opts = usvg::Options::default();
@@ -121,16 +117,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tree = load_svg(&svg_path, &svg_opts);
 
-    // Debounced watcher (FULL): preserves original notify::Event (EventKind, paths, etc.)
     let (tx, rx) = mpsc::channel::<DebounceEventResult>();
     let _debouncer = {
         let tx = tx.clone();
         let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
-            // ignore send errors on shutdown
             let _ = tx.send(res);
         })?;
-
-        // Watch the file itself (best signal/noise). NonRecursive is fine for a file.
         debouncer.watch(&svg_path, RecursiveMode::NonRecursive)?;
         debouncer
     };
@@ -149,32 +141,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("{e:?}"))?;
 
-    window.set_target_fps(60);
-
     let mut pan = (0.0f32, 0.0f32);
     let mut zoom = 1.0f32;
     let mut auto_fit = true;
     let mut fit_scale = 1.0f32;
+
     let mut dirty = true;
     let mut buffer: Vec<u32> = vec![0; width * height];
 
+    // Needed for i3/X11: repaint once when window becomes active again.
+    let mut was_active = window.is_active();
+
+    // How often to poll window/input while idle (no redraw needed).
+    // Not a "sleep every frame": we block on the watcher channel for up to this.
+    let poll_active = Duration::from_millis(16); // ~60 Hz responsiveness
+    let poll_inactive = Duration::from_millis(100);
+
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // 1) Drain watcher queue; reload at most once per frame.
+        let active = window.is_active();
+        if active && !was_active {
+            dirty = true;
+        }
+        was_active = active;
+
+        // 1) Drain watcher queue; reload at most once per iteration.
         let mut reload = false;
         while let Ok(res) = rx.try_recv() {
             match res {
                 Ok(events) => {
                     for e in events {
-                        // DebouncedEvent derefs to notify::Event
                         if e.paths.iter().any(|p| p == &svg_path) && should_reload(&e.kind) {
                             reload = true;
                         }
                     }
                 }
-                Err(_errors) => {
-                    // conservative: if backend reports errors, you may want to reload/rescan
-                    reload = true;
-                }
+                Err(_) => reload = true,
             }
         }
         if reload {
@@ -205,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // 4) Input -> mark dirty only on change
+        // 4) Input
         let pan_speed = 10.0;
         if window.is_key_down(Key::K) {
             pan.1 += pan_speed;
@@ -244,20 +245,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             dirty = true;
         }
 
-        // 5) Render + present only when dirty (cuts idle CPU a lot)
+        // 5) Present if dirty, else block waiting for file events (with timeout to poll window).
         if dirty {
             if let Some(ref t) = tree {
                 buffer = render(t, width as u32, height as u32, pan, zoom, fit_scale);
             } else {
                 buffer.fill(0x00333333);
             }
+            dirty = false;
+
             window
                 .update_with_buffer(&buffer, width, height)
                 .map_err(|e| format!("{e:?}"))?;
-            dirty = false;
         } else {
-            // still pump events; avoids full-frame blit
+            // Pump window events once (non-blocking)
             window.update();
+
+            // Block until something happens (file change) or timeout to poll input again.
+            let timeout = if window.is_active() {
+                poll_active
+            } else {
+                poll_inactive
+            };
+            match rx.recv_timeout(timeout) {
+                Ok(res) => {
+                    // We got at least one fs event; push it back into handling by marking reload.
+                    // Also drain any immediately-available events next loop iteration.
+                    match res {
+                        Ok(events) => {
+                            if events.iter().any(|e| {
+                                e.paths.iter().any(|p| p == &svg_path) && should_reload(&e.kind)
+                            }) {
+                                // reload next iteration
+                                // (we could reload here, but keeping logic centralized above is simpler)
+                                // mark dirty so if reload fails (parse error), we still repaint background.
+                                dirty = true;
+                            }
+                        }
+                        Err(_) => {
+                            dirty = true;
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            }
         }
     }
 
