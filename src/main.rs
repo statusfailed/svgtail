@@ -63,12 +63,13 @@ fn should_reload(kind: &EventKind) -> bool {
     }
 }
 
+/// Wait for the watched path to be created before trying to render
 fn wait_for_creation(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     if path.exists() {
         return Ok(());
     }
     eprintln!(
-        "{} does not exist, waiting for it to be created...",
+        "file '{}' does not exist, waiting for it to be created...",
         path.display()
     );
 
@@ -115,18 +116,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut svg_opts = usvg::Options::default();
     svg_opts.fontdb_mut().load_system_fonts();
 
+    event_loop(svg_path, svg_opts)
+}
+
+fn event_loop(
+    svg_path: PathBuf,
+    svg_opts: usvg::Options,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut tree = load_svg(&svg_path, &svg_opts);
-
-    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
-    let _debouncer = {
-        let tx = tx.clone();
-        let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
-            let _ = tx.send(res);
-        })?;
-        debouncer.watch(&svg_path, RecursiveMode::NonRecursive)?;
-        debouncer
-    };
-
     let mut width: usize = 800;
     let mut height: usize = 600;
 
@@ -141,29 +138,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("{e:?}"))?;
 
-    let mut pan = (0.0f32, 0.0f32);
-    let mut zoom = 1.0f32;
-    let mut auto_fit = true;
-    let mut fit_scale = 1.0f32;
+    window.set_target_fps(60);
+
+    let (tx, rx) = mpsc::channel::<DebounceEventResult>();
+    let _debouncer = {
+        let tx = tx.clone();
+        let mut debouncer = new_debouncer(Duration::from_millis(200), None, move |res| {
+            let _ = tx.send(res);
+        })?;
+        debouncer.watch(&svg_path, RecursiveMode::NonRecursive)?;
+        debouncer
+    };
+
+    let mut state = State::new();
 
     let mut dirty = true;
     let mut buffer: Vec<u32> = vec![0; width * height];
 
-    // Needed for i3/X11: repaint once when window becomes active again.
-    let mut was_active = window.is_active();
-
-    // How often to poll window/input while idle (no redraw needed).
-    // Not a "sleep every frame": we block on the watcher channel for up to this.
-    let poll_active = Duration::from_millis(16); // ~60 Hz responsiveness
-    let poll_inactive = Duration::from_millis(100);
-
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        let active = window.is_active();
-        if active && !was_active {
-            dirty = true;
-        }
-        was_active = active;
-
         // 1) Drain watcher queue; reload at most once per iteration.
         let mut reload = false;
         while let Ok(res) = rx.try_recv() {
@@ -181,9 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if reload {
             if let Some(new_tree) = load_svg(&svg_path, &svg_opts) {
                 tree = Some(new_tree);
-                pan = (0.0, 0.0);
-                zoom = 1.0;
-                auto_fit = true;
+                state.reset();
                 dirty = true;
             }
         }
@@ -198,57 +188,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 3) Fit scale only when needed
-        if dirty && auto_fit {
+        if dirty {
             if let Some(ref t) = tree {
-                let svg_size = t.size();
-                fit_scale =
-                    (width as f32 / svg_size.width()).min(height as f32 / svg_size.height());
+                state.update_fit_scale(t, width, height);
             }
         }
 
         // 4) Input
-        let pan_speed = 10.0;
-        if window.is_key_down(Key::K) {
-            pan.1 += pan_speed;
-            auto_fit = false;
-            dirty = true;
-        }
-        if window.is_key_down(Key::J) {
-            pan.1 -= pan_speed;
-            auto_fit = false;
-            dirty = true;
-        }
-        if window.is_key_down(Key::H) {
-            pan.0 += pan_speed;
-            auto_fit = false;
-            dirty = true;
-        }
-        if window.is_key_down(Key::L) {
-            pan.0 -= pan_speed;
-            auto_fit = false;
-            dirty = true;
-        }
-        if window.is_key_down(Key::Equal) || window.is_key_down(Key::NumPadPlus) {
-            zoom *= 1.1;
-            auto_fit = false;
-            dirty = true;
-        }
-        if window.is_key_down(Key::Minus) || window.is_key_down(Key::NumPadMinus) {
-            zoom /= 1.1;
-            auto_fit = false;
-            dirty = true;
-        }
-        if window.is_key_down(Key::R) {
-            pan = (0.0, 0.0);
-            zoom = 1.0;
-            auto_fit = true;
+        if state.handle_input(&mut window) {
             dirty = true;
         }
 
-        // 5) Present if dirty, else block waiting for file events (with timeout to poll window).
+        // 5) Present if dirty
         if dirty {
             if let Some(ref t) = tree {
-                buffer = render(t, width as u32, height as u32, pan, zoom, fit_scale);
+                buffer = render(
+                    t,
+                    width as u32,
+                    height as u32,
+                    state.pan,
+                    state.zoom,
+                    state.fit_scale,
+                );
             } else {
                 buffer.fill(0x00333333);
             }
@@ -260,38 +221,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // Pump window events once (non-blocking)
             window.update();
-
-            // Block until something happens (file change) or timeout to poll input again.
-            let timeout = if window.is_active() {
-                poll_active
-            } else {
-                poll_inactive
-            };
-            match rx.recv_timeout(timeout) {
-                Ok(res) => {
-                    // We got at least one fs event; push it back into handling by marking reload.
-                    // Also drain any immediately-available events next loop iteration.
-                    match res {
-                        Ok(events) => {
-                            if events.iter().any(|e| {
-                                e.paths.iter().any(|p| p == &svg_path) && should_reload(&e.kind)
-                            }) {
-                                // reload next iteration
-                                // (we could reload here, but keeping logic centralized above is simpler)
-                                // mark dirty so if reload fails (parse error), we still repaint background.
-                                dirty = true;
-                            }
-                        }
-                        Err(_) => {
-                            dirty = true;
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {}
-            }
         }
     }
 
     Ok(())
+}
+
+struct State {
+    pan: (f32, f32),
+    zoom: f32,
+    auto_fit: bool,
+    fit_scale: f32,
+    was_active: bool,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            pan: (0.0, 0.0),
+            zoom: 1.0,
+            auto_fit: true,
+            fit_scale: 1.0,
+            was_active: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.pan = (0.0, 0.0);
+        self.zoom = 1.0;
+        self.auto_fit = true;
+    }
+
+    fn update_fit_scale(&mut self, tree: &usvg::Tree, width: usize, height: usize) {
+        if self.auto_fit {
+            let svg_size = tree.size();
+            self.fit_scale =
+                (width as f32 / svg_size.width()).min(height as f32 / svg_size.height());
+        }
+    }
+
+    fn handle_input(&mut self, window: &mut Window) -> bool {
+        let mut changed = false;
+
+        let active = window.is_active();
+        if active && !self.was_active {
+            changed = true;
+        }
+        self.was_active = active;
+
+        let pan_speed = 10.0;
+
+        if window.is_key_down(Key::K) {
+            self.pan.1 += pan_speed;
+            self.auto_fit = false;
+            changed = true;
+        }
+        if window.is_key_down(Key::J) {
+            self.pan.1 -= pan_speed;
+            self.auto_fit = false;
+            changed = true;
+        }
+        if window.is_key_down(Key::H) {
+            self.pan.0 += pan_speed;
+            self.auto_fit = false;
+            changed = true;
+        }
+        if window.is_key_down(Key::L) {
+            self.pan.0 -= pan_speed;
+            self.auto_fit = false;
+            changed = true;
+        }
+        if window.is_key_down(Key::Equal) || window.is_key_down(Key::NumPadPlus) {
+            self.zoom *= 1.1;
+            self.auto_fit = false;
+            changed = true;
+        }
+        if window.is_key_down(Key::Minus) || window.is_key_down(Key::NumPadMinus) {
+            self.zoom /= 1.1;
+            self.auto_fit = false;
+            changed = true;
+        }
+        if window.is_key_down(Key::R) {
+            self.reset();
+            changed = true;
+        }
+
+        changed
+    }
 }
